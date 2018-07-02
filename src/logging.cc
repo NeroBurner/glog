@@ -255,6 +255,9 @@ static bool TerminalSupportsColor() {
       !strcmp(term, "xterm-color") ||
       !strcmp(term, "xterm-256color") ||
       !strcmp(term, "screen-256color") ||
+      !strcmp(term, "konsole") ||
+      !strcmp(term, "konsole-16color") ||
+      !strcmp(term, "konsole-256color") ||
       !strcmp(term, "screen") ||
       !strcmp(term, "linux") ||
       !strcmp(term, "cygwin");
@@ -296,7 +299,7 @@ static GLogColor SeverityToColor(LogSeverity severity) {
 #ifdef OS_WINDOWS
 
 // Returns the character attribute for the given color.
-WORD GetColorAttribute(GLogColor color) {
+static WORD GetColorAttribute(GLogColor color) {
   switch (color) {
     case COLOR_RED:    return FOREGROUND_RED;
     case COLOR_GREEN:  return FOREGROUND_GREEN;
@@ -308,7 +311,7 @@ WORD GetColorAttribute(GLogColor color) {
 #else
 
 // Returns the ANSI color code for the given color.
-const char* GetAnsiColorCode(GLogColor color) {
+static const char* GetAnsiColorCode(GLogColor color) {
   switch (color) {
   case COLOR_RED:     return "1";
   case COLOR_GREEN:   return "2";
@@ -331,7 +334,6 @@ const size_t LogMessage::kMaxLogMessageLen = 30000;
 
 struct LogMessage::LogMessageData  {
   LogMessageData();
-  void reset();
 
   int preserved_errno_;      // preserved errno
   // Buffer space; contains complete message text.
@@ -1156,15 +1158,11 @@ static LogMessage::LogMessageData fatal_msg_data_shared;
 // LogMessageData object exists (in this case glog makes zero heap memory
 // allocations).
 static GLOG_THREAD_LOCAL_STORAGE bool thread_data_available = true;
-static GLOG_THREAD_LOCAL_STORAGE LogMessage::LogMessageData thread_msg_data;
+static GLOG_THREAD_LOCAL_STORAGE char thread_msg_data[sizeof(LogMessage::LogMessageData)];
 #endif // defined(GLOG_THREAD_LOCAL_STORAGE)
 
 LogMessage::LogMessageData::LogMessageData()
   : stream_(message_text_, LogMessage::kMaxLogMessageLen, 0) {
-}
-
-void LogMessage::LogMessageData::reset() {
-    stream_.reset();
 }
 
 LogMessage::LogMessage(const char* file, int line, LogSeverity severity,
@@ -1223,10 +1221,7 @@ void LogMessage::Init(const char* file,
     // No need for locking, because this is thread local.
     if (thread_data_available) {
       thread_data_available = false;
-      data_ = &thread_msg_data;
-      // Make sure to clear log data since it may have been used and filled with
-      // data. We do not want to append the new message to the previous one.
-      data_->reset();
+      data_ = new (&thread_msg_data) LogMessageData;
     } else {
       allocated_ = new LogMessageData();
       data_ = allocated_;
@@ -1304,10 +1299,16 @@ void LogMessage::Init(const char* file,
 LogMessage::~LogMessage() {
   Flush();
 #ifdef GLOG_THREAD_LOCAL_STORAGE
-  if (data_ == &thread_msg_data)
+  if (data_ == static_cast<void*>(thread_msg_data)) {
+    data_->~LogMessageData();
     thread_data_available = true;
-#endif // defined(GLOG_THREAD_LOCAL_STORAGE)
+  }
+  else {
+    delete allocated_;
+  }
+#else // !defined(GLOG_THREAD_LOCAL_STORAGE)
   delete allocated_;
+#endif // defined(GLOG_THREAD_LOCAL_STORAGE)
 }
 
 int LogMessage::preserved_errno() const {
@@ -1714,6 +1715,7 @@ void LogToStderr() {
 namespace base {
 namespace internal {
 
+bool GetExitOnDFatal();
 bool GetExitOnDFatal() {
   MutexLock l(&log_mutex);
   return exit_on_dfatal;
@@ -1729,6 +1731,7 @@ bool GetExitOnDFatal() {
 // and the stack trace is not recorded.  The LOG(FATAL) *will* still
 // exit the program.  Since this function is used only in testing,
 // these differences are acceptable.
+void SetExitOnDFatal(bool value);
 void SetExitOnDFatal(bool value) {
   MutexLock l(&log_mutex);
   exit_on_dfatal = value;
@@ -1736,6 +1739,42 @@ void SetExitOnDFatal(bool value) {
 
 }  // namespace internal
 }  // namespace base
+
+// Shell-escaping as we need to shell out ot /bin/mail.
+static const char kDontNeedShellEscapeChars[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+            "0123456789+-_.=/:,@";
+
+static string ShellEscape(const string& src) {
+  string result;
+  if (!src.empty() &&  // empty string needs quotes
+      src.find_first_not_of(kDontNeedShellEscapeChars) == string::npos) {
+    // only contains chars that don't need quotes; it's fine
+    result.assign(src);
+  } else if (src.find_first_of('\'') == string::npos) {
+    // no single quotes; just wrap it in single quotes
+    result.assign("'");
+    result.append(src);
+    result.append("'");
+  } else {
+    // needs double quote escaping
+    result.assign("\"");
+    for (size_t i = 0; i < src.size(); ++i) {
+      switch (src[i]) {
+        case '\\':
+        case '$':
+        case '"':
+        case '`':
+          result.append("\\");
+      }
+      result.append(src, i, 1);
+    }
+    result.append("\"");
+  }
+  return result;
+}
+
 
 // use_logging controls whether the logging functions LOG/VLOG are used
 // to log errors.  It should be set to false when the caller holds the
@@ -1752,7 +1791,10 @@ static bool SendEmailInternal(const char*dest, const char *subject,
     }
 
     string cmd =
-        FLAGS_logmailer + " -s\"" + subject + "\" " + dest;
+        FLAGS_logmailer + " -s" +
+        ShellEscape(subject) + " " + ShellEscape(dest);
+    VLOG(4) << "Mailing command: " << cmd;
+
     FILE* pipe = popen(cmd.c_str(), "w");
     if (pipe != NULL) {
       // Add the body if we have one
